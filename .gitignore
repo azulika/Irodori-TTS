@@ -217,3 +217,12 @@ __marimo__/
 
 gradio_outputs/
 gradio_outputs_voicedesign/
+.claude/settings.local.json
+.idea/inspectionProfiles/profiles_settings.xml
+.idea/inspectionProfiles/Project_Default.xml
+.idea/Irodori-TTS.iml
+.idea/misc.xml
+.idea/modules.xml
+.idea/vcs.xml
+/gradio_outputs_hybrid
+/model

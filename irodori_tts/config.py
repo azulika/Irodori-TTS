@@ -45,8 +45,12 @@ class ModelConfig:
     def speaker_patched_latent_dim(self) -> int:
         return self.patched_latent_dim * self.speaker_patch_size
 
+    use_speaker_condition_override: bool | None = None
+
     @property
     def use_speaker_condition(self) -> bool:
+        if self.use_speaker_condition_override is not None:
+            return bool(self.use_speaker_condition_override)
         # Voice-design checkpoints are caption-driven and intentionally omit
         # reference-speaker conditioning to avoid the easier shortcut.
         return not bool(self.use_caption_condition)

@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+"""
+Hybrid Gradio app: voice clone (reference audio) + voice design (caption)
+using a merged dual-conditioned checkpoint.
+"""
 from __future__ import annotations
 
 import argparse
@@ -27,6 +31,10 @@ GRADIO_AUDIO_COLS_PER_ROW = 8
 
 
 def _default_checkpoint() -> str:
+    # Prefer merged checkpoint if present
+    merged = Path("model/merged_normal_plus_caption.safetensors")
+    if merged.exists():
+        return str(merged)
     candidates = sorted(
         [
             *Path(".").glob("**/checkpoint_*.pt"),
@@ -103,23 +111,21 @@ def _resolve_checkpoint_path(raw_checkpoint: str) -> str:
     checkpoint = str(raw_checkpoint).strip()
     if checkpoint == "":
         raise ValueError("checkpoint is required.")
-
     suffix = Path(checkpoint).suffix.lower()
     if suffix in {".pt", ".safetensors"}:
         return checkpoint
-
     resolved = hf_hub_download(repo_id=checkpoint, filename="model.safetensors")
-    print(f"[gradio] checkpoint: hf://{checkpoint} -> {resolved}", flush=True)
+    print(f"[gradio-hybrid] checkpoint: hf://{checkpoint} -> {resolved}", flush=True)
     return str(resolved)
 
 
 def _build_runtime_key(
-        checkpoint: str,
-        model_device: str,
-        model_precision: str,
-        codec_device: str,
-        codec_precision: str,
-        enable_watermark: bool,
+    checkpoint: str,
+    model_device: str,
+    model_precision: str,
+    codec_device: str,
+    codec_precision: str,
+    enable_watermark: bool,
 ) -> RuntimeKey:
     checkpoint_path = _resolve_checkpoint_path(checkpoint)
     return RuntimeKey(
@@ -136,12 +142,12 @@ def _build_runtime_key(
 
 
 def _load_model(
-        checkpoint: str,
-        model_device: str,
-        model_precision: str,
-        codec_device: str,
-        codec_precision: str,
-        enable_watermark: bool,
+    checkpoint: str,
+    model_device: str,
+    model_precision: str,
+    codec_device: str,
+    codec_precision: str,
+    enable_watermark: bool,
 ) -> str:
     runtime_key = _build_runtime_key(
         checkpoint=checkpoint,
@@ -151,18 +157,24 @@ def _load_model(
         codec_precision=codec_precision,
         enable_watermark=enable_watermark,
     )
-    _, reloaded = get_cached_runtime(runtime_key)
+    runtime, reloaded = get_cached_runtime(runtime_key)
     if reloaded:
         status = "loaded model into memory"
     else:
         status = "model already loaded; reused existing runtime"
+    caps = []
+    if runtime.model_cfg.use_speaker_condition:
+        caps.append("speaker (voice clone)")
+    if runtime.model_cfg.use_caption_condition:
+        caps.append("caption (voice design)")
     return (
         f"{status}\n"
         f"checkpoint: {runtime_key.checkpoint}\n"
         f"model_device: {runtime_key.model_device}\n"
         f"model_precision: {runtime_key.model_precision}\n"
         f"codec_device: {runtime_key.codec_device}\n"
-        f"codec_precision: {runtime_key.codec_precision}"
+        f"codec_precision: {runtime_key.codec_precision}\n"
+        f"conditioning: {', '.join(caps) if caps else 'text only'}"
     )
 
 
@@ -170,17 +182,14 @@ def _load_model(
 # メタデータ埋め込み用・読み取り用関数群 (ID3v2.3 準拠 / 外部ライブラリなし)
 # =================================================================================
 def _encode_synchsafe(size: int) -> bytes:
-    """ID3タグヘッダ用の28bit同期安全整数"""
     return bytes([(size >> 21) & 0x7F, (size >> 14) & 0x7F, (size >> 7) & 0x7F, size & 0x7F])
 
 
 def _parse_synchsafe(b: bytes) -> int:
-    """ID3タグヘッダの28bit同期安全整数をパース"""
     return (b[0] << 21) | (b[1] << 14) | (b[2] << 7) | b[3]
 
 
 def _create_id3v2_3_frame(frame_id: str, payload: bytes) -> bytes:
-    """ID3v2.3 のフレームを作成"""
     frame_id_bytes = frame_id.encode("ascii")
     size_bytes = struct.pack(">I", len(payload))
     flags = b"\x00\x00"
@@ -209,8 +218,7 @@ def _parse_txxx(payload: bytes) -> tuple[str, str]:
         return ("", "")
     encoding = payload[0]
     data = payload[1:]
-
-    if encoding == 1:  # UTF-16
+    if encoding == 1:
         parts = []
         last_idx = 0
         for i in range(0, len(data) - 1, 2):
@@ -241,11 +249,10 @@ def _parse_id3v2_3_text(payload: bytes) -> str:
 
 
 def _embed_metadata_to_wav(filepath: str | Path, text: str, params_json: str) -> None:
-    """WAVファイルの末尾に `id3 ` チャンクを追加してUTF-16でメタデータを埋め込む。"""
     frames = b""
     title = text.replace("\n", " ")[:64] + ("..." if len(text) > 64 else "")
     frames += _create_id3v2_3_frame("TIT2", _create_text_payload_utf16(title))
-    frames += _create_id3v2_3_frame("TSSE", _create_text_payload_utf16("Irodori-TTS Gradio"))
+    frames += _create_id3v2_3_frame("TSSE", _create_text_payload_utf16("Irodori-TTS Gradio Hybrid"))
     frames += _create_id3v2_3_frame("TXXX", _create_txxx_payload_utf16("Prompt", text))
     frames += _create_id3v2_3_frame("TXXX", _create_txxx_payload_utf16("Generation Parameters", params_json))
     frames += _create_id3v2_3_frame("COMM", _create_comm_payload_utf16(params_json))
@@ -257,11 +264,9 @@ def _embed_metadata_to_wav(filepath: str | Path, text: str, params_json: str) ->
         data = f.read()
         if not data.startswith(b"RIFF") or data[8:12] != b"WAVE":
             return
-
         pad = b"\x00" if len(id3_tag) % 2 != 0 else b""
         id3_chunk = b"id3 " + struct.pack("<I", len(id3_tag)) + id3_tag + pad
         new_riff_size = len(data) - 8 + len(id3_chunk)
-
         f.seek(4)
         f.write(struct.pack("<I", new_riff_size))
         f.seek(0, 2)
@@ -269,17 +274,13 @@ def _embed_metadata_to_wav(filepath: str | Path, text: str, params_json: str) ->
 
 
 def _read_metadata_from_wav(filepath: str | Path) -> dict[str, str]:
-    """WAVファイル内のID3タグを解析して辞書化する"""
     filepath = Path(filepath)
     if not filepath.exists():
         return {"error": "File not found"}
-
     with open(filepath, "rb") as f:
         data = f.read()
-
     if not data.startswith(b"RIFF") or data[8:12] != b"WAVE":
         return {"error": "Not a valid WAV file"}
-
     offset = 12
     id3_data = None
     while offset < len(data):
@@ -291,19 +292,14 @@ def _read_metadata_from_wav(filepath: str | Path) -> dict[str, str]:
             id3_data = data[offset + 8:offset + 8 + chunk_size]
             break
         offset += 8 + chunk_size + (chunk_size % 2)
-
     if not id3_data:
         return {"error": "No ID3 metadata found in the WAV file"}
-
     if not id3_data.startswith(b"ID3"):
         return {"error": "Invalid ID3 header"}
-
     tag_size = _parse_synchsafe(id3_data[6:10])
     frames_data = id3_data[10:10 + tag_size]
-
     offset = 0
     parsed_metadata: dict[str, str] = {}
-
     while offset < len(frames_data):
         frame_id_bytes = frames_data[offset:offset + 4]
         frame_id = frame_id_bytes.decode("ascii", errors="ignore")
@@ -311,14 +307,11 @@ def _read_metadata_from_wav(filepath: str | Path) -> dict[str, str]:
             break
         if offset + 10 > len(frames_data):
             break
-
         frame_size = struct.unpack(">I", frames_data[offset + 4:offset + 8])[0]
         payload = frames_data[offset + 10:offset + 10 + frame_size]
         offset += 10 + frame_size
-
         if not payload:
             continue
-
         if frame_id == "TXXX":
             desc, val = _parse_txxx(payload)
             if desc:
@@ -342,31 +335,25 @@ def _read_metadata_from_wav(filepath: str | Path) -> dict[str, str]:
         elif frame_id.startswith("T"):
             val = _parse_id3v2_3_text(payload)
             parsed_metadata[frame_id] = val
-
     return parsed_metadata
 
 
 def _extract_metadata_ui(filepath: str | None) -> tuple[str, str, dict | str]:
     if filepath is None or str(filepath).strip() == "":
         return "", "", {}
-
     metadata = _read_metadata_from_wav(filepath)
     if "error" in metadata:
         return f"Error: {metadata['error']}", "", {}
-
     prompt = metadata.get("Prompt", "")
     params_json_str = metadata.get("Generation Parameters", "{}")
-
     try:
         params = json.loads(params_json_str) if params_json_str else {}
     except json.JSONDecodeError:
         params = {"raw_text": params_json_str}
-
     other_info_lines = []
     for k, v in metadata.items():
         if k not in ["Prompt", "Generation Parameters", "Comment"]:
             other_info_lines.append(f"{k}: {v}")
-
     return prompt, "\n".join(other_info_lines), params
 
 
@@ -374,30 +361,34 @@ def _extract_metadata_ui(filepath: str | None) -> tuple[str, str, dict | str]:
 
 
 def _run_generation(
-        checkpoint: str,
-        model_device: str,
-        model_precision: str,
-        codec_device: str,
-        codec_precision: str,
-        enable_watermark: bool,
-        text: str,
-        uploaded_audio: str | None,
-        num_steps: int,
-        num_candidates: int,
-        seed_raw: str,
-        cfg_guidance_mode: str,
-        cfg_scale_text: float,
-        cfg_scale_speaker: float,
-        cfg_scale_raw: str,
-        cfg_min_t: float,
-        cfg_max_t: float,
-        context_kv_cache: bool,
-        truncation_factor_raw: str,
-        rescale_k_raw: str,
-        rescale_sigma_raw: str,
-        speaker_kv_scale_raw: str,
-        speaker_kv_min_t_raw: str,
-        speaker_kv_max_layers_raw: str,
+    checkpoint: str,
+    model_device: str,
+    model_precision: str,
+    codec_device: str,
+    codec_precision: str,
+    enable_watermark: bool,
+    text: str,
+    caption: str,
+    uploaded_audio: str | None,
+    num_steps: int,
+    num_candidates: int,
+    seed_raw: str,
+    cfg_guidance_mode: str,
+    cfg_scale_text: float,
+    cfg_scale_caption: float,
+    cfg_scale_speaker: float,
+    cfg_scale_raw: str,
+    cfg_min_t: float,
+    cfg_max_t: float,
+    context_kv_cache: bool,
+    max_text_len_raw: str,
+    max_caption_len_raw: str,
+    truncation_factor_raw: str,
+    rescale_k_raw: str,
+    rescale_sigma_raw: str,
+    speaker_kv_scale_raw: str,
+    speaker_kv_min_t_raw: str,
+    speaker_kv_max_layers_raw: str,
 ) -> tuple[object, ...]:
     def stdout_log(msg: str) -> None:
         print(msg, flush=True)
@@ -411,8 +402,12 @@ def _run_generation(
         enable_watermark=enable_watermark,
     )
 
-    if str(text).strip() == "":
+    text_value = str(text).strip()
+    caption_value = str(caption).strip() if caption else ""
+
+    if text_value == "":
         raise ValueError("text is required.")
+
     requested_candidates = int(num_candidates)
     if requested_candidates <= 0:
         raise ValueError("num_candidates must be >= 1.")
@@ -420,6 +415,8 @@ def _run_generation(
         raise ValueError(f"num_candidates must be <= {MAX_GRADIO_CANDIDATES}.")
 
     cfg_scale = _parse_optional_float(cfg_scale_raw, "cfg_scale")
+    max_text_len = _parse_optional_int(max_text_len_raw, "max_text_len")
+    max_caption_len = _parse_optional_int(max_caption_len_raw, "max_caption_len")
     truncation_factor = _parse_optional_float(truncation_factor_raw, "truncation_factor")
     rescale_k = _parse_optional_float(rescale_k_raw, "rescale_k")
     rescale_sigma = _parse_optional_float(rescale_sigma_raw, "rescale_sigma")
@@ -430,47 +427,37 @@ def _run_generation(
 
     ref_wav = _resolve_ref_wav(uploaded_audio=uploaded_audio)
     no_ref = ref_wav is None
-    ref_normalize_db = -16.0
-    ref_ensure_max = True
 
     runtime, reloaded = get_cached_runtime(runtime_key)
-    stdout_log(f"[gradio] runtime: {'reloaded' if reloaded else 'reused'}")
+    stdout_log(f"[gradio-hybrid] runtime: {'reloaded' if reloaded else 'reused'}")
     stdout_log(
-        (
-            "[gradio] request: model_device={} model_precision={} codec_device={} codec_precision={} "
-            "watermark={} mode={} seconds={} steps={} seed={} no_ref={} candidates={}"
-        ).format(
-            model_device,
-            model_precision,
-            codec_device,
-            codec_precision,
-            enable_watermark,
-            cfg_guidance_mode,
-            FIXED_SECONDS,
-            num_steps,
-            "random" if seed is None else seed,
-            no_ref,
-            requested_candidates,
+        "[gradio-hybrid] conditioning: text={} caption={} speaker={}".format(
+            "on",
+            "on" if caption_value else "off",
+            "ref" if ref_wav else "no-ref",
         )
     )
 
     result = runtime.synthesize(
         SamplingRequest(
-            text=str(text),
+            text=text_value,
+            caption=caption_value or None,
             ref_wav=ref_wav,
             ref_latent=None,
             no_ref=bool(no_ref),
-            ref_normalize_db=ref_normalize_db,
-            ref_ensure_max=bool(ref_ensure_max),
+            ref_normalize_db=-16.0,
+            ref_ensure_max=True,
             num_candidates=requested_candidates,
             decode_mode="sequential",
             seconds=FIXED_SECONDS,
             max_ref_seconds=30.0,
-            max_text_len=None,
+            max_text_len=max_text_len,
+            max_caption_len=max_caption_len,
             num_steps=int(num_steps),
             seed=None if seed is None else int(seed),
             cfg_guidance_mode=str(cfg_guidance_mode),
             cfg_scale_text=float(cfg_scale_text),
+            cfg_scale_caption=float(cfg_scale_caption),
             cfg_scale_speaker=float(cfg_scale_speaker),
             cfg_scale=cfg_scale,
             cfg_min_t=float(cfg_min_t),
@@ -489,12 +476,14 @@ def _run_generation(
 
     # メタデータ用のJSON構築
     gen_params = {
-        "text": str(text),
+        "text": text_value,
+        "caption": caption_value or None,
         "checkpoint": checkpoint,
         "num_steps": int(num_steps),
         "seed_used": result.used_seed,
         "cfg_guidance_mode": str(cfg_guidance_mode),
         "cfg_scale_text": float(cfg_scale_text),
+        "cfg_scale_caption": float(cfg_scale_caption),
         "cfg_scale_speaker": float(cfg_scale_speaker),
         "cfg_scale": cfg_scale,
         "cfg_min_t": float(cfg_min_t),
@@ -510,26 +499,24 @@ def _run_generation(
     }
     if ref_wav is not None:
         gen_params["ref_wav"] = Path(ref_wav).name
-
     gen_params = {k: v for k, v in gen_params.items() if v is not None}
     params_json = json.dumps(gen_params, ensure_ascii=False)
 
-    out_dir = Path("gradio_outputs")
+    out_dir = Path("gradio_outputs_hybrid")
     out_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     out_paths: list[str] = []
 
     for i, audio in enumerate(result.audios, start=1):
         out_path = save_wav(
-            out_dir / f"{str(text)[0:10]}.wav",
+            out_dir / f"{text_value[:10]}_{stamp}_{i:03d}.wav",
             audio.float(),
             result.sample_rate,
         )
         try:
-            _embed_metadata_to_wav(out_path, text=str(text), params_json=params_json)
+            _embed_metadata_to_wav(out_path, text=text_value, params_json=params_json)
         except Exception as exc:
-            stdout_log(f"[gradio] Failed to embed metadata to {out_path}: {exc}")
-
+            stdout_log(f"[gradio-hybrid] Failed to embed metadata to {out_path}: {exc}")
         out_paths.append(str(out_path))
 
     runtime_msg = "runtime: reloaded" if reloaded else "runtime: reused"
@@ -542,7 +529,7 @@ def _run_generation(
     ]
     detail_text = "\n".join(detail_lines)
     timing_text = _format_timings(result.stage_timings, result.total_to_decode)
-    stdout_log(f"[gradio] saved {len(out_paths)} candidates")
+    stdout_log(f"[gradio-hybrid] saved {len(out_paths)} candidates")
 
     audio_updates: list[object] = []
     for i in range(MAX_GRADIO_CANDIDATES):
@@ -566,10 +553,11 @@ def build_ui() -> gr.Blocks:
     model_precision_choices = _precision_choices_for_device(default_model_device)
     codec_precision_choices = _precision_choices_for_device(default_codec_device)
 
-    with gr.Blocks(title="Irodori-TTS Gradio") as demo:
-        gr.Markdown("# Irodori-TTS Inference (Cached Runtime)")
+    with gr.Blocks(title="Irodori-TTS Hybrid") as demo:
+        gr.Markdown("# Irodori-TTS Hybrid (Voice Clone + Voice Design)")
         gr.Markdown(
-            "When settings are unchanged, runtime is reused and only sampling/decoding runs."
+            "マージ済みチェックポイントで、リファレンス音声（ボイスクローン）と"
+            "キャプション（ボイスデザイン）の両方を同時に使えます。"
         )
 
         with gr.Tabs():
@@ -615,10 +603,19 @@ def build_ui() -> gr.Blocks:
                     clear_cache_msg = gr.Textbox(label="Model Status", interactive=False)
 
                 text = gr.Textbox(label="Text", lines=4)
-                uploaded_audio = gr.Audio(
-                    label="Reference Audio Upload (optional, blank = no-reference mode)",
-                    type="filepath",
-                )
+
+                with gr.Row():
+                    with gr.Column(scale=1):
+                        caption = gr.Textbox(
+                            label="Caption / Style Prompt (optional — voice design)",
+                            lines=3,
+                            placeholder="例: 落ち着いた女性の声、低めのトーン",
+                        )
+                    with gr.Column(scale=1):
+                        uploaded_audio = gr.Audio(
+                            label="Reference Audio (optional — voice clone)",
+                            type="filepath",
+                        )
 
                 with gr.Accordion("Sampling", open=True):
                     with gr.Row():
@@ -645,6 +642,13 @@ def build_ui() -> gr.Blocks:
                             value=3.0,
                             step=0.1,
                         )
+                        cfg_scale_caption = gr.Slider(
+                            label="CFG Scale Caption",
+                            minimum=0.0,
+                            maximum=10.0,
+                            value=4.0,
+                            step=0.1,
+                        )
                         cfg_scale_speaker = gr.Slider(
                             label="CFG Scale Speaker",
                             minimum=0.0,
@@ -659,6 +663,9 @@ def build_ui() -> gr.Blocks:
                         cfg_min_t = gr.Number(label="CFG Min t", value=0.5)
                         cfg_max_t = gr.Number(label="CFG Max t", value=1.0)
                         context_kv_cache = gr.Checkbox(label="Context KV Cache", value=True)
+                    with gr.Row():
+                        max_text_len_raw = gr.Textbox(label="Max Text Len (optional)", value="")
+                        max_caption_len_raw = gr.Textbox(label="Max Caption Len (optional)", value="")
                     with gr.Row():
                         truncation_factor_raw = gr.Textbox(label="Truncation Factor (optional)", value="")
                         rescale_k_raw = gr.Textbox(label="Rescale k (optional)", value="")
@@ -703,17 +710,21 @@ def build_ui() -> gr.Blocks:
                         codec_precision,
                         enable_watermark,
                         text,
+                        caption,
                         uploaded_audio,
                         num_steps,
                         num_candidates,
                         seed_raw,
                         cfg_guidance_mode,
                         cfg_scale_text,
+                        cfg_scale_caption,
                         cfg_scale_speaker,
                         cfg_scale_raw,
                         cfg_min_t,
                         cfg_max_t,
                         context_kv_cache,
+                        max_text_len_raw,
+                        max_caption_len_raw,
                         truncation_factor_raw,
                         rescale_k_raw,
                         rescale_sigma_raw,
@@ -767,9 +778,9 @@ def build_ui() -> gr.Blocks:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Gradio app for Irodori-TTS with cached runtime.")
+    parser = argparse.ArgumentParser(description="Hybrid Gradio app for Irodori-TTS (voice clone + voice design).")
     parser.add_argument("--server-name", default="127.0.0.1")
-    parser.add_argument("--server-port", type=int, default=7860)
+    parser.add_argument("--server-port", type=int, default=7862)
     parser.add_argument("--share", action="store_true")
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
