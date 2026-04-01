@@ -40,6 +40,7 @@ from irodori_tts.inference_runtime import (
 # デフォルト設定
 # ──────────────────────────────────────────────
 DEFAULT_MODEL = os.getenv("NARRATE_MODEL", "")
+# https://drive.google.com/file/d/1PpyDukF4RIzccMXoLOok99cC8iL190YB/view?usp=drive_link
 DEFAULT_CAPTION = os.getenv("NARRATE_CAPTION", "")
 DEFAULT_REF_WAV = os.getenv("NARRATE_REF_WAV", "")
 DEFAULT_REF_TRANSCRIPT = os.getenv("NARRATE_REF_TRANSCRIPT", "")
@@ -250,39 +251,51 @@ def main() -> None:
             chunk_seconds = estimate_duration(
                 target_text=normalized_chunk,
                 reference_speech=args.ref_wav,
-                reference_transcript=ref_transcript_normalized,
+                reference_transcript=ref_transcript_normalized if ref_transcript_normalized else None,
                 target_lang=lang_code,
                 reference_lang=lang_code,
             )
         chunk_seconds *= DURATION_MULTIPLIER  # 補正
-        print(f"[gen {i}/{len(chunks)}] ({len(chunk)}字, {chunk_seconds:.1f}s) {chunk[:50]}{'…' if len(chunk) > 50 else ''}")
-        t1 = time.perf_counter()
+        attempt = 0
+        while True:
+            attempt += 1
+            print(f"[gen {i}/{len(chunks)}] ({len(chunk)}字, {chunk_seconds:.1f}s{f', retry#{attempt-1}' if attempt > 1 else ''}) {chunk[:50]}{'…' if len(chunk) > 50 else ''}")
+            t1 = time.perf_counter()
 
-        result = runtime.synthesize(
-            SamplingRequest(
-                text=chunk,
-                caption=args.caption,
-                ref_wav=args.ref_wav,
-                no_ref=False,
-                num_candidates=1,
-                decode_mode="sequential",
-                seconds=float(chunk_seconds),
-                num_steps=int(args.num_steps),
-                seed=args.seed,
-                cfg_scale_text=float(args.cfg_scale_text),
-                cfg_scale_caption=float(args.cfg_scale_caption),
-                cfg_scale_speaker=float(args.cfg_scale_speaker),
-                cfg_guidance_mode="independent",
-                context_kv_cache=True,
-                trim_tail=True,
-            ),
-            log_fn=None,
-        )
+            result = runtime.synthesize(
+                SamplingRequest(
+                    text=chunk,
+                    caption=args.caption,
+                    ref_wav=args.ref_wav,
+                    no_ref=False,
+                    num_candidates=1,
+                    decode_mode="sequential",
+                    seconds=float(chunk_seconds),
+                    num_steps=int(args.num_steps),
+                    seed=args.seed,
+                    cfg_scale_text=float(args.cfg_scale_text),
+                    cfg_scale_caption=float(args.cfg_scale_caption),
+                    cfg_scale_speaker=float(args.cfg_scale_speaker),
+                    cfg_guidance_mode="independent",
+                    context_kv_cache=True,
+                    trim_tail=True,
+                ),
+                log_fn=None,
+            )
 
-        elapsed = time.perf_counter() - t1
-        total_gen += elapsed
-        audio_sec = result.audio.shape[-1] / result.sample_rate
-        print(f"        → {audio_sec:.2f}s 音声 (生成: {elapsed:.1f}s, seed={result.used_seed})")
+            elapsed = time.perf_counter() - t1
+            total_gen += elapsed
+            audio_sec = result.audio.shape[-1] / result.sample_rate
+            margin = chunk_seconds - audio_sec
+
+            if margin >= 1.0:
+                # 余裕が1秒以上 → OK
+                print(f"        → {audio_sec:.2f}s 音声 (余裕{margin:.1f}s, 生成: {elapsed:.1f}s, seed={result.used_seed})")
+                break
+            else:
+                # 尺が足りない → estimate を +1s してリトライ
+                print(f"        → {audio_sec:.2f}s 音声 (余裕{margin:.1f}s < 1.0s, リトライ)")
+                chunk_seconds += 1.0
 
         audio_parts.append(result.audio)
         # 最後のチャンク以外は無音を挟む
