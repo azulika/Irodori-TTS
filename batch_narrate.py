@@ -43,12 +43,13 @@ DEFAULT_MODEL = os.getenv("NARRATE_MODEL", "")
 DEFAULT_CAPTION = os.getenv("NARRATE_CAPTION", "")
 DEFAULT_REF_WAV = os.getenv("NARRATE_REF_WAV", "")
 DEFAULT_REF_TRANSCRIPT = os.getenv("NARRATE_REF_TRANSCRIPT", "")
+DURATION_MULTIPLIER = float(os.getenv("DURATION_MULTIPLIER", "1.0"))
 DEFAULT_CFG_CAPTION = 11.9
 DEFAULT_CFG_TEXT = 3.0
 DEFAULT_CFG_SPEAKER = 5.0
 DEFAULT_NUM_STEPS = 40
 CHUNK_LIMIT = 150
-CHUNK_MIN = 50  # これ以下なら改行で分割せず次に結合
+CHUNK_MIN = 20  # これ以下なら改行で分割せず次に結合
 SILENCE_SEC = 0.001  # チャンク間の無音（秒）
 
 
@@ -99,8 +100,21 @@ def _split_by_delimiter(text: str, limit: int) -> list[str]:
     return chunks
 
 
+SEP_MARKER = "[sep]"
+
+
 def split_text(text: str, limit: int = CHUNK_LIMIT, minimum: int = CHUNK_MIN) -> list[str]:
     """テキストを朗読バッチ用に分割する。"""
+    # 0. [sep]マーカーで強制分割してから各セグメントを個別に処理
+    segments = re.split(re.escape(SEP_MARKER), text, flags=re.IGNORECASE)
+    if len(segments) > 1:
+        chunks: list[str] = []
+        for seg in segments:
+            seg = seg.strip()
+            if seg:
+                chunks.extend(split_text(seg, limit, minimum))
+        return chunks
+
     # 1. 改行で分割しつつ、短すぎる行は次の行と結合
     lines = text.splitlines()
 
@@ -221,9 +235,11 @@ def main() -> None:
     total_gen = 0.0
 
     # リファレンス書き起こしを正規化（1回だけ）
-    ref_transcript_normalized = args.ref_transcript
+    ref_transcript_normalized = args.ref_transcript or None
     if ref_transcript_normalized:
         ref_transcript_normalized, _ = normalize_text_with_lang(ref_transcript_normalized, "ja")
+    print(f"[debug] ref_wav={args.ref_wav}")
+    print(f"[debug] ref_transcript={ref_transcript_normalized!r}")
 
     for i, chunk in enumerate(chunks, 1):
         # 秒数の決定: 明示指定 > estimate_duration による自動推定
@@ -238,6 +254,7 @@ def main() -> None:
                 target_lang=lang_code,
                 reference_lang=lang_code,
             )
+        chunk_seconds *= DURATION_MULTIPLIER  # 補正
         print(f"[gen {i}/{len(chunks)}] ({len(chunk)}字, {chunk_seconds:.1f}s) {chunk[:50]}{'…' if len(chunk) > 50 else ''}")
         t1 = time.perf_counter()
 
@@ -249,7 +266,7 @@ def main() -> None:
                 no_ref=False,
                 num_candidates=1,
                 decode_mode="sequential",
-                seconds=chunk_seconds,
+                seconds=float(chunk_seconds),
                 num_steps=int(args.num_steps),
                 seed=args.seed,
                 cfg_scale_text=float(args.cfg_scale_text),

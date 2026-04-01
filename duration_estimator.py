@@ -40,8 +40,15 @@ SPP_MINMAX = {
     "zh": (0.18, 0.36),
     "other": (0.07, 0.18),
 }
+# EMOJI_ANNOTATIONS に記載の絵文字一覧 (1絵文字あたり +1秒)
+EMOJI_ANNOTATIONS = set(
+    "👂 😮‍💨 ⏸️ 🤭 🥵 📢 😏 🥺 🌬️ 😮 👅 💋 🫶 😭 😱 😪 ⏩ 📞 🐢 🥤 🤧 😒 😰 😆 😠 😲 🥱 😖 😟 🫣 🙄 😊 👌 🙏 🥴 🎵 🤐 😌 🤔".split()
+)
+EMOJI_BONUS_SEC = 1.0
+
 MIN_DURATION_SEC = 0.5
 MAX_DURATION_SEC = 120.0
+_debug = True  # duration推定のデバッグ出力
 
 _g2p_en = None
 
@@ -81,6 +88,10 @@ def _safe_detect_language(text: str) -> str:
     return "en"  # fallback to English pacing
 
 
+from dotenv import load_dotenv
+
+load_dotenv()
+
 def _phoneme_count_en(text: str) -> int:
     global _g2p_en
     if G2p is None:
@@ -92,7 +103,8 @@ def _phoneme_count_en(text: str) -> int:
 
 
 def _phoneme_count_ja(text: str) -> int:
-    if pyopenjtalk is None:
+    IS_PYOPEN = os.getenv("IS_PYOPEN", "")
+    if pyopenjtalk is None or IS_PYOPEN.lower() == "false":
         return len(text)
     ph = pyopenjtalk.g2p(text)
     return len([p for p in ph.split(" ") if p and p not in {"pau", "sil"}])
@@ -204,14 +216,20 @@ def estimate_duration(
             ref_text = reference_transcript or target_text
             ref_lang = _canonicalize_lang(reference_lang) or _safe_detect_language(ref_text)
             ref_phonemes = max(_phoneme_count(ref_text, ref_lang), 1)
-            spp = audio_duration / ref_phonemes
-            spp = _clamp(spp, SPP_MINMAX.get(ref_lang, SPP_MINMAX["other"]))
+            raw_spp = audio_duration / ref_phonemes
+            spp = _clamp(raw_spp, SPP_MINMAX.get(ref_lang, SPP_MINMAX["other"]))
+            if _debug:
+                print(f"[duration debug] ref_audio={audio_duration:.2f}s, ref_phonemes={ref_phonemes}, "
+                      f"raw_spp={raw_spp:.4f}, clamped_spp={spp:.4f}, pyopenjtalk={'yes' if pyopenjtalk else 'NO'}")
+
+    # 絵文字ボーナス: EMOJI_ANNOTATIONS に含まれる絵文字1つにつき +1秒
+    emoji_count = sum(1 for ch in target_text if ch in EMOJI_ANNOTATIONS)
 
     # Compute duration
     if ref_has_audio:
         punct_bonus = _punctuation_bonus_sec(target_text) * 0.3
     else:
         punct_bonus = _punctuation_bonus_sec(target_text)
-    duration = tgt_phonemes * spp + punct_bonus
+    duration = tgt_phonemes * spp + punct_bonus + emoji_count * EMOJI_BONUS_SEC
     duration = max(MIN_DURATION_SEC, min(duration, MAX_DURATION_SEC))
     return duration
