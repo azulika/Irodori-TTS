@@ -638,21 +638,21 @@ def build_ui() -> gr.Blocks:
                         cfg_scale_text = gr.Slider(
                             label="CFG Scale Text",
                             minimum=0.0,
-                            maximum=10.0,
+                            maximum=100.0,
                             value=3.0,
                             step=0.1,
                         )
                         cfg_scale_caption = gr.Slider(
                             label="CFG Scale Caption",
                             minimum=0.0,
-                            maximum=10.0,
+                            maximum=100.0,
                             value=4.0,
                             step=0.1,
                         )
                         cfg_scale_speaker = gr.Slider(
                             label="CFG Scale Speaker",
                             minimum=0.0,
-                            maximum=10.0,
+                            maximum=100.0,
                             value=5.0,
                             step=0.1,
                         )
