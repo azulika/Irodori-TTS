@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 from dataclasses import asdict
 
 import torch
@@ -1721,8 +1722,8 @@ class TextToLatentRFDiT(nn.Module):
         self,
         text_input_ids: torch.Tensor,
         text_mask: torch.Tensor,
-        ref_latent: torch.Tensor | None,
-        ref_mask: torch.Tensor | None,
+        ref_latent: torch.Tensor | Sequence[torch.Tensor] | None,
+        ref_mask: torch.Tensor | Sequence[torch.Tensor] | None,
         caption_input_ids: torch.Tensor | None = None,
         caption_mask: torch.Tensor | None = None,
         speaker_state_override: torch.Tensor | None = None,
@@ -1799,13 +1800,43 @@ class TextToLatentRFDiT(nn.Module):
                         dtype=text_state.dtype,
                     )
                 else:
-                    ref_latent, ref_mask = patch_sequence_with_mask(
-                        seq=ref_latent,
-                        mask=ref_mask,
-                        patch_size=self.cfg.speaker_patch_size,
-                    )
-                    ref_state = self.speaker_encoder(ref_latent, ref_mask)
-                    ref_state = self.speaker_norm(ref_state)
+                    # Accept a single reference (tensor) or multiple references
+                    # (sequence of tensors). Each segment is encoded independently
+                    # so RoPE positions restart at 0 per reference file; the
+                    # resulting states are concatenated along time. Speaker
+                    # context carries no positional encoding in JointAttention,
+                    # so this is equivalent to a larger unordered token set.
+                    if isinstance(ref_latent, torch.Tensor):
+                        ref_latent_segments = [ref_latent]
+                        ref_mask_segments = [ref_mask]
+                    else:
+                        ref_latent_segments = list(ref_latent)
+                        ref_mask_segments = (
+                            [ref_mask]
+                            if isinstance(ref_mask, torch.Tensor)
+                            else list(ref_mask)
+                        )
+                    if len(ref_latent_segments) != len(ref_mask_segments):
+                        raise ValueError(
+                            f"ref_latent segments ({len(ref_latent_segments)}) and ref_mask "
+                            f"segments ({len(ref_mask_segments)}) must have the same length."
+                        )
+                    if len(ref_latent_segments) == 0:
+                        raise ValueError("ref_latent segment list must not be empty.")
+                    segment_states: list[torch.Tensor] = []
+                    segment_masks: list[torch.Tensor] = []
+                    for seg_latent, seg_mask in zip(ref_latent_segments, ref_mask_segments):
+                        seg_latent, seg_mask = patch_sequence_with_mask(
+                            seq=seg_latent,
+                            mask=seg_mask,
+                            patch_size=self.cfg.speaker_patch_size,
+                        )
+                        seg_state = self.speaker_encoder(seg_latent, seg_mask)
+                        seg_state = self.speaker_norm(seg_state)
+                        segment_states.append(seg_state)
+                        segment_masks.append(seg_mask)
+                    ref_state = torch.cat(segment_states, dim=1)
+                    ref_mask = torch.cat(segment_masks, dim=1)
                     ref_state, ref_mask = self._prepend_masked_mean_token(ref_state, ref_mask)
             ref_state, ref_mask = self._apply_speaker_condition_dropout(
                 speaker_state=ref_state,
@@ -1888,8 +1919,8 @@ class TextToLatentRFDiT(nn.Module):
         t: torch.Tensor | None,
         text_input_ids: torch.Tensor,
         text_mask: torch.Tensor,
-        ref_latent: torch.Tensor | None,
-        ref_mask: torch.Tensor | None,
+        ref_latent: torch.Tensor | Sequence[torch.Tensor] | None,
+        ref_mask: torch.Tensor | Sequence[torch.Tensor] | None,
         caption_input_ids: torch.Tensor | None = None,
         caption_mask: torch.Tensor | None = None,
         latent_mask: torch.Tensor | None = None,

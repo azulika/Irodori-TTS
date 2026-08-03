@@ -839,7 +839,10 @@ class InferenceRuntime:
         req: SamplingRequest,
         batch_size: int,
         messages: list[str],
-    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    ) -> tuple[
+        torch.Tensor | list[torch.Tensor] | None,
+        torch.Tensor | list[torch.Tensor] | None,
+    ]:
         runtime_dtype = next(self.model.parameters()).dtype
         max_ref_seconds = (
             self.default_max_ref_seconds
@@ -900,6 +903,10 @@ class InferenceRuntime:
                 ),
             )
 
+        # Each reference file becomes its own latent piece. The pieces are NOT
+        # concatenated here: they are encoded independently by the speaker
+        # encoder (RoPE positions restart at 0 per file) and their states are
+        # concatenated inside encode_conditions. max_ref_seconds applies per file.
         if latent_paths:
             latent_pieces: list[torch.Tensor] = []
             for path in latent_paths:
@@ -909,18 +916,20 @@ class InferenceRuntime:
                 ).unsqueeze(0)
                 if piece.shape[1] == 0:
                     raise ValueError(f"Reference latent is empty: {path}")
-                latent_pieces.append(piece.to(dtype=runtime_dtype))
                 if (
                     max_ref_latent_steps is not None
-                    and sum(int(item.shape[1]) for item in latent_pieces)
-                    >= max_ref_latent_steps
+                    and piece.shape[1] > max_ref_latent_steps
                 ):
-                    break
-            ref_latent = torch.cat(latent_pieces, dim=1)
+                    messages.append(
+                        f"warning: reference latent steps ({piece.shape[1]}) of '{path}' exceed "
+                        f"max_ref_seconds bound ({max_ref_latent_steps} steps). Trimming."
+                    )
+                    piece = piece[:, :max_ref_latent_steps]
+                latent_pieces.append(piece.to(dtype=runtime_dtype))
             if len(latent_paths) > 1:
                 messages.append(
-                    f"info: concatenated {len(latent_pieces)}/{len(latent_paths)} reference latents "
-                    f"in input order ({ref_latent.shape[1]} steps before max-length trimming)."
+                    f"info: {len(latent_pieces)} reference latents will be encoded "
+                    "independently and their speaker states concatenated."
                 )
         else:
             if req.ref_normalize_db is not None:
@@ -934,11 +943,11 @@ class InferenceRuntime:
             latent_pieces = []
             for path in wav_paths:
                 wav, sr = _load_audio(path)
-                if len(wav_paths) == 1 and max_ref_seconds > 0:
+                if max_ref_seconds > 0:
                     max_ref_samples = max(1, int(max_ref_seconds * float(sr)))
                     if wav.shape[1] > max_ref_samples:
                         messages.append(
-                            f"warning: reference audio exceeds max_ref_seconds ({max_ref_seconds}s). "
+                            f"warning: reference audio '{path}' exceeds max_ref_seconds ({max_ref_seconds}s). "
                             f"Trimming from {float(wav.shape[1]) / float(sr):.2f}s to {float(max_ref_samples) / float(sr):.2f}s."
                         )
                         wav = wav[:, :max_ref_samples]
@@ -950,45 +959,44 @@ class InferenceRuntime:
                 ).cpu()
                 if piece.shape[1] == 0:
                     raise ValueError(f"Reference waveform produced an empty latent: {path}")
-                latent_pieces.append(piece)
                 if (
                     max_ref_latent_steps is not None
-                    and sum(int(item.shape[1]) for item in latent_pieces)
-                    >= max_ref_latent_steps
+                    and piece.shape[1] > max_ref_latent_steps
                 ):
-                    break
-            ref_latent = torch.cat(latent_pieces, dim=1)
+                    piece = piece[:, :max_ref_latent_steps]
+                latent_pieces.append(piece)
             if len(wav_paths) > 1:
                 messages.append(
-                    f"info: encoded and concatenated {len(latent_pieces)}/{len(wav_paths)} "
-                    "reference waveforms in input order "
-                    f"({ref_latent.shape[1]} latent steps before max-length trimming)."
+                    f"info: {len(latent_pieces)} reference waveforms will be encoded "
+                    "independently and their speaker states concatenated."
                 )
 
-        if max_ref_latent_steps is not None and ref_latent.shape[1] > max_ref_latent_steps:
-            messages.append(
-                f"warning: combined reference latent steps ({ref_latent.shape[1]}) exceed "
-                f"max_ref_seconds bound ({max_ref_latent_steps} steps). "
-                "Trimming the concatenated reference latent."
+        patched_latents: list[torch.Tensor] = []
+        patched_masks: list[torch.Tensor] = []
+        for idx, piece in enumerate(latent_pieces):
+            piece_patched = patchify_latent(piece, self.model_cfg.latent_patch_size).to(
+                device=self.model_device,
+                dtype=runtime_dtype,
             )
-            ref_latent = ref_latent[:, :max_ref_latent_steps]
+            if piece_patched.shape[1] == 0:
+                raise ValueError(
+                    f"Reference latent length became zero after patchify (reference #{idx + 1}). "
+                    "Use longer reference audio."
+                )
+            if batch_size > 1:
+                piece_patched = piece_patched.repeat(batch_size, 1, 1)
+            patched_latents.append(piece_patched)
+            patched_masks.append(
+                torch.ones(
+                    (batch_size, piece_patched.shape[1]),
+                    dtype=torch.bool,
+                    device=self.model_device,
+                )
+            )
 
-        ref_latent_patched = patchify_latent(ref_latent, self.model_cfg.latent_patch_size).to(
-            device=self.model_device,
-            dtype=runtime_dtype,
-        )
-        if ref_latent_patched.shape[1] == 0:
-            raise ValueError(
-                "Reference latent length became zero after patchify. Use longer reference audio."
-            )
-        if batch_size > 1:
-            ref_latent_patched = ref_latent_patched.repeat(batch_size, 1, 1)
-        ref_mask = torch.ones(
-            (batch_size, ref_latent_patched.shape[1]),
-            dtype=torch.bool,
-            device=self.model_device,
-        )
-        return ref_latent_patched, ref_mask
+        if len(patched_latents) == 1:
+            return patched_latents[0], patched_masks[0]
+        return patched_latents, patched_masks
 
     def _load_speaker_embedding_condition(
         self,
@@ -1264,7 +1272,12 @@ class InferenceRuntime:
                 if speaker_mask_override is not None:
                     has_speaker_duration = speaker_mask_override.any(dim=1)
                 elif self.model_cfg.use_speaker_condition_resolved and ref_mask is not None:
-                    has_speaker_duration = ref_mask.any(dim=1)
+                    if isinstance(ref_mask, torch.Tensor):
+                        has_speaker_duration = ref_mask.any(dim=1)
+                    else:
+                        has_speaker_duration = torch.stack(
+                            [m.any(dim=1) for m in ref_mask], dim=0
+                        ).any(dim=0)
                 duration_features = build_duration_features(
                     [normalized_text] * num_candidates,
                     token_counts=text_mask.sum(dim=1),
