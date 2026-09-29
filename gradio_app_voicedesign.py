@@ -45,7 +45,7 @@ def _default_checkpoint() -> str:
         return str(preferred[-1])
     if candidates:
         return str(candidates[-1])
-    return "Aratako/Irodori-TTS-v4.1-Small"
+    return "Aratako/Irodori-TTS-v4-Large"
 
 
 def _default_model_device() -> str:
@@ -424,7 +424,7 @@ def build_ui() -> gr.Blocks:
     with gr.Blocks(title="Irodori-TTS VoiceDesign Gradio") as demo:
         gr.Markdown("# Irodori-TTS VoiceDesign Inference")
         gr.Markdown(
-            "Irodori-TTS-v4.1-Small向けの統合UIです。captionを入れると声質・スタイルを指定でき、"
+            "Irodori-TTS-v4-Large向けの統合UIです。captionを入れると声質・スタイルを指定でき、"
             "参照音声と組み合わせることもできます。"
         )
 

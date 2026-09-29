@@ -5,18 +5,17 @@ import hashlib
 import json
 import math
 import secrets
+import struct
 import threading
 import time
-from collections.abc import Callable
-from contextlib import nullcontext
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import torch
 import torchaudio
-from safetensors import safe_open
-from safetensors.torch import load_file as load_safetensors_file
 
 from .codec import DACVAECodec, patchify_latent, unpatchify_latent
 from .config import ModelConfig, merge_dataclass_overrides
@@ -25,7 +24,6 @@ from .lora import checkpoint_state_uses_lora, is_lora_adapter_dir, load_lora_ada
 from .meanflow import sample_euler_meanflow
 from .model import TextToLatentRFDiT
 from .quantization import (
-    is_torchao_quantized_state_dict,
     parse_quantization_metadata,
     unflatten_quantized_state_dict,
 )
@@ -491,21 +489,103 @@ def _default_max_ref_seconds(train_cfg: dict | None) -> float:
     return _LEGACY_MAX_REF_SECONDS
 
 
-def _load_checkpoint_from_safetensors(
+_SAFETENSORS_DTYPES: dict[str, torch.dtype] = {
+    "F64": torch.float64,
+    "F32": torch.float32,
+    "F16": torch.float16,
+    "BF16": torch.bfloat16,
+    "I64": torch.int64,
+    "I32": torch.int32,
+    "I16": torch.int16,
+    "I8": torch.int8,
+    "U8": torch.uint8,
+    "BOOL": torch.bool,
+}
+for _name, _attr in (
+    ("F8_E4M3", "float8_e4m3fn"),
+    ("F8_E5M2", "float8_e5m2"),
+    ("U16", "uint16"),
+    ("U32", "uint32"),
+    ("U64", "uint64"),
+):
+    if hasattr(torch, _attr):
+        _SAFETENSORS_DTYPES[_name] = getattr(torch, _attr)
+
+
+def _read_safetensors_header(path: Path) -> tuple[dict[str, dict], dict[str, str], int]:
+    """Return (tensor_header, metadata, data_base_offset) for a safetensors file.
+
+    Only the JSON header is read. This deliberately avoids ``safe_open`` /
+    ``load_file``: on Windows they map the whole file through
+    ``UntypedStorage.from_file`` which charges roughly twice the file size
+    against the system commit limit just to open it, and for multi-GB
+    checkpoints that alone can exhaust RAM + pagefile.
+    """
+    with open(path, "rb") as handle:
+        raw_len = handle.read(8)
+        if len(raw_len) != 8:
+            raise ValueError(f"Safetensors checkpoint is truncated: {path}")
+        header_len = struct.unpack("<Q", raw_len)[0]
+        raw_header = handle.read(header_len)
+    if len(raw_header) != header_len:
+        raise ValueError(f"Safetensors checkpoint header is truncated: {path}")
+    try:
+        header = json.loads(raw_header)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise ValueError(f"Invalid safetensors header: {path}") from exc
+    if not isinstance(header, dict):
+        raise ValueError(f"Invalid safetensors header: {path}")
+    metadata = header.pop("__metadata__", None) or {}
+    if not isinstance(metadata, dict):
+        raise ValueError(f"Invalid safetensors metadata: {path}")
+    return header, {str(k): str(v) for k, v in metadata.items()}, 8 + header_len
+
+
+def _iter_safetensors_tensors(path: Path) -> Iterator[tuple[str, torch.Tensor]]:
+    """Yield (name, cpu_tensor) one tensor at a time using plain file reads.
+
+    Each tensor is read into its own buffer, so peak host memory is one tensor
+    rather than the full checkpoint (plus the file-mapping commit overhead of
+    ``safe_open``). Callers that need everything at once can wrap this in
+    ``dict(...)``.
+    """
+    header, _, base_offset = _read_safetensors_header(path)
+    with open(path, "rb", buffering=0) as handle:
+        for name, info in header.items():
+            if not isinstance(info, dict):
+                raise ValueError(f"Invalid safetensors entry {name!r}: {path}")
+            dtype = _SAFETENSORS_DTYPES.get(str(info.get("dtype")))
+            if dtype is None:
+                raise ValueError(
+                    f"Unsupported safetensors dtype {info.get('dtype')!r} for {name!r}: {path}"
+                )
+            shape = tuple(int(dim) for dim in info.get("shape", ()))
+            start, stop = (int(x) for x in info["data_offsets"])
+            nbytes = stop - start
+            if nbytes <= 0:
+                yield name, torch.empty(shape, dtype=dtype)
+                continue
+            buffer = bytearray(nbytes)
+            view = memoryview(buffer)
+            handle.seek(base_offset + start)
+            filled = 0
+            while filled < nbytes:
+                # readinto may return short reads (Windows caps a single read at 2 GiB).
+                got = handle.readinto(view[filled:])
+                if not got:
+                    raise ValueError(f"Safetensors checkpoint is truncated at {name!r}: {path}")
+                filled += got
+            del view
+            yield name, torch.frombuffer(buffer, dtype=dtype).reshape(shape)
+
+
+def _read_safetensors_checkpoint_metadata(
     path: Path,
-) -> tuple[dict[str, torch.Tensor], dict, dict | None, dict | None]:
-    model_state = load_safetensors_file(str(path), device="cpu")
-    if not isinstance(model_state, dict) or not model_state:
+) -> tuple[dict[str, str], dict, dict | None, dict | None]:
+    """Parse checkpoint configs from safetensors metadata without reading any tensor data."""
+    header, metadata, _ = _read_safetensors_header(path)
+    if not header:
         raise ValueError(f"Safetensors checkpoint has no model weights: {path}")
-
-    with safe_open(str(path), framework="pt", device="cpu") as handle:
-        metadata = handle.metadata() or {}
-
-    if parse_quantization_metadata(metadata) is not None:
-        model_state, _ = unflatten_quantized_state_dict(
-            model_state,
-            metadata=metadata,
-        )
 
     flat_config = _parse_json_mapping(
         metadata.get(_CONFIG_META_KEY),
@@ -519,6 +599,24 @@ def _load_checkpoint_from_safetensors(
         path=path,
     )
     model_cfg, inference_cfg = _split_flat_checkpoint_config(path=path, flat_config=flat_config)
+    return metadata, model_cfg, inference_cfg, text_encoder_config
+
+
+def _load_checkpoint_from_safetensors(
+    path: Path,
+) -> tuple[dict[str, torch.Tensor], dict, dict | None, dict | None]:
+    metadata, model_cfg, inference_cfg, text_encoder_config = (
+        _read_safetensors_checkpoint_metadata(path)
+    )
+    model_state = dict(_iter_safetensors_tensors(path))
+    if not model_state:
+        raise ValueError(f"Safetensors checkpoint has no model weights: {path}")
+
+    if parse_quantization_metadata(metadata) is not None:
+        model_state, _ = unflatten_quantized_state_dict(
+            model_state,
+            metadata=metadata,
+        )
     return model_state, model_cfg, inference_cfg, text_encoder_config
 
 
@@ -528,6 +626,117 @@ def _load_checkpoint_for_inference(
     if path.suffix.lower() == ".safetensors":
         return _load_checkpoint_from_safetensors(path)
     return _load_checkpoint_from_pt(path)
+
+
+def _is_torchao_tensor(tensor: torch.Tensor) -> bool:
+    return type(tensor).__module__.startswith("torchao.")
+
+
+def _materialize_state_tensor(
+    tensor: torch.Tensor,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Move one checkpoint tensor to its final inference device/dtype.
+
+    Plain floating-point weights are cast to the runtime dtype here so the fp32
+    checkpoint copy never has to live on the target device. TorchAO quantized
+    tensors keep their stored format; `_move_inference_module` applies the same
+    dtype policy to them as before.
+    """
+    if _is_torchao_tensor(tensor) or not tensor.is_floating_point():
+        return tensor.to(device=device)
+    return tensor.to(device=device, dtype=dtype)
+
+
+def _iter_checkpoint_tensors_for_inference(
+    path: Path,
+    *,
+    metadata: dict[str, str] | None,
+) -> Iterator[tuple[str, torch.Tensor]]:
+    """Yield checkpoint tensors one at a time on CPU.
+
+    Unquantized safetensors checkpoints are read tensor by tensor with plain
+    file reads, so the host never holds the whole checkpoint at once.
+    Quantized safetensors and legacy .pt checkpoints still need the full CPU
+    dictionary (TorchAO reconstruction / torch.load), but entries are popped as
+    they are yielded so each tensor is released as soon as it is materialized.
+    """
+    if path.suffix.lower() == ".safetensors":
+        if metadata is None:
+            metadata, _, _, _ = _read_safetensors_checkpoint_metadata(path)
+        if parse_quantization_metadata(metadata) is None:
+            yield from _iter_safetensors_tensors(path)
+            return
+        flat_state = dict(_iter_safetensors_tensors(path))
+        model_state, _ = unflatten_quantized_state_dict(flat_state, metadata=metadata)
+        del flat_state
+    else:
+        model_state, _, _, _ = _load_checkpoint_from_pt(path)
+
+    for name in list(model_state.keys()):
+        yield name, model_state.pop(name)
+
+
+def _load_inference_state_dict(
+    path: Path,
+    *,
+    metadata: dict[str, str] | None,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> dict[str, torch.Tensor]:
+    """Build the runtime state dict directly on the inference device/dtype."""
+    state: dict[str, torch.Tensor] = {}
+    for name, tensor in _iter_checkpoint_tensors_for_inference(path, metadata=metadata):
+        state[name] = _materialize_state_tensor(tensor, device=device, dtype=dtype)
+        del tensor
+    if not state:
+        raise ValueError(f"Checkpoint has no model weights: {path}")
+    return state
+
+
+@contextmanager
+def _meta_parameters() -> Iterator[None]:
+    """Construct modules with parameters on the meta device.
+
+    Only parameters are redirected to ``meta``; buffers stay real so values
+    computed in ``__init__`` (RoPE tables, embedding scales, ...) remain valid.
+    Parameters are expected to be filled afterwards with
+    ``load_state_dict(..., assign=True)``. This avoids materializing and
+    randomly initializing a full fp32 copy of the model on the host, which for
+    multi-billion-parameter checkpoints doubles peak host memory during load.
+    """
+    original_register_parameter = torch.nn.Module.register_parameter
+
+    def register_parameter(
+        module: torch.nn.Module, name: str, param: torch.nn.Parameter | None
+    ) -> None:
+        original_register_parameter(module, name, param)
+        if param is None:
+            return
+        registered = module._parameters[name]
+        if registered is None or registered.is_meta:
+            return
+        module._parameters[name] = torch.nn.Parameter(
+            registered.to(device="meta"), requires_grad=registered.requires_grad
+        )
+
+    torch.nn.Module.register_parameter = register_parameter  # type: ignore[method-assign]
+    try:
+        yield
+    finally:
+        torch.nn.Module.register_parameter = original_register_parameter  # type: ignore[method-assign]
+
+
+def _assert_no_meta_tensors(module: torch.nn.Module) -> None:
+    leftover = [name for name, param in module.named_parameters() if param.is_meta]
+    leftover += [name for name, buffer in module.named_buffers() if buffer.is_meta]
+    if leftover:
+        preview = ", ".join(leftover[:8])
+        raise RuntimeError(
+            f"{len(leftover)} model tensors were not populated from the checkpoint: {preview}"
+        )
 
 
 def _split_hf_checkpoint_source(source: str) -> tuple[str, str | None]:
@@ -635,26 +844,40 @@ class InferenceRuntime:
         )
 
         checkpoint_path = Path(key.checkpoint)
-        model_state, model_cfg_dict, train_cfg, text_encoder_config = (
-            _load_checkpoint_for_inference(checkpoint_path)
-        )
+        checkpoint_metadata: dict[str, str] | None = None
+        if checkpoint_path.suffix.lower() == ".safetensors":
+            checkpoint_metadata, model_cfg_dict, train_cfg, text_encoder_config = (
+                _read_safetensors_checkpoint_metadata(checkpoint_path)
+            )
+        else:
+            _, model_cfg_dict, train_cfg, text_encoder_config = _load_checkpoint_from_pt(
+                checkpoint_path
+            )
         model_cfg = merge_dataclass_overrides(
             ModelConfig(),
             model_cfg_dict,
             section="checkpoint model_config",
         )
 
-        model = TextToLatentRFDiT(
-            model_cfg,
-            pretrained_backbone_config=text_encoder_config,
-            load_pretrained_backbone_weights=not model_cfg.use_pretrained_text_encoder,
+        # Build the module skeleton without allocating parameter storage, then
+        # stream checkpoint tensors straight onto the inference device/dtype and
+        # attach them with assign=True. Host memory stays at roughly one tensor
+        # instead of "full fp32 checkpoint + full fp32 random init".
+        with _meta_parameters():
+            model = TextToLatentRFDiT(
+                model_cfg,
+                pretrained_backbone_config=text_encoder_config,
+                load_pretrained_backbone_weights=not model_cfg.use_pretrained_text_encoder,
+            )
+        model_state = _load_inference_state_dict(
+            checkpoint_path,
+            metadata=checkpoint_metadata,
+            device=model_device,
+            dtype=model_dtype,
         )
-        quantized_model = is_torchao_quantized_state_dict(model_state)
-        model.load_state_dict(
-            model_state,
-            assign=model_cfg.use_pretrained_text_encoder or quantized_model,
-        )
-        model = model.to(model_device)
+        model.load_state_dict(model_state, assign=True)
+        del model_state
+        _assert_no_meta_tensors(model)
         model = _move_inference_module(model, device=model_device, dtype=model_dtype)
         model.eval()
         model = _maybe_compile_inference_model(

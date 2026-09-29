@@ -37,7 +37,7 @@ def _default_checkpoint() -> str:
         ]
     )
     if not candidates:
-        return "Aratako/Irodori-TTS-v4.1-Small"
+        return "Aratako/Irodori-TTS-v4-Large"
     return str(candidates[-1])
 
 
@@ -406,7 +406,7 @@ def build_ui() -> gr.Blocks:
         gr.Markdown("# Irodori-TTS Inference (Cached Runtime)")
         gr.Markdown(
             "Reference-audio cloning / Speaker Inversion UI. "
-            "Irodori-TTS-v4.1-Small is used by default; unchanged settings reuse the cached runtime."
+            "Irodori-TTS-v4-Large is used by default; unchanged settings reuse the cached runtime."
         )
 
         with gr.Row():
